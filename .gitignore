@@ -1,2 +1,4 @@
-# all env files
-.env*
+# env files
+.env
+.env.local
+.env.*.local
