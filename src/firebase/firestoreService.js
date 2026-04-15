@@ -2,114 +2,175 @@
 import {
   collection,
   addDoc,
-  getDocs,
-  getDoc,
   updateDoc,
   deleteDoc,
   doc,
   query,
   where,
   orderBy,
+  getDocs,
   serverTimestamp,
   writeBatch,
+  Timestamp,
 } from "firebase/firestore";
 import { db } from "./firebase";
 
-// ─── Accounts ──────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// ACCOUNTS
+// ─────────────────────────────────────────────────────────────
 
+/**
+ * Create a new account for the authenticated user.
+ * @param {string} userId
+ * @param {{ name: string, bankName: string, type: string }} data
+ */
 export async function createAccount(userId, { name, bankName, type }) {
-  return addDoc(collection(db, "accounts"), {
-    user_id: userId,
+  const ref = await addDoc(collection(db, "accounts"), {
+    user_id:    userId,
     name,
-    bank_name: bankName,
+    bank_name:  bankName,
     type,
     created_at: serverTimestamp(),
   });
+  return ref.id;
 }
 
-export async function getAccounts(userId) {
-  const q = query(
-    collection(db, "accounts"),
-    where("user_id", "==", userId),
-    orderBy("created_at", "asc")
+/**
+ * Rename an account. Only updates mutable fields.
+ */
+export async function updateAccount(accountId, { name, bankName, type }) {
+  const updates = {};
+  if (name !== undefined)     updates.name      = name;
+  if (bankName !== undefined) updates.bank_name = bankName;
+  if (type !== undefined)     updates.type      = type;
+  await updateDoc(doc(db, "accounts", accountId), updates);
+}
+
+/**
+ * Delete account and all its transactions atomically.
+ * Firestore max batch size is 500 — chunks if needed.
+ */
+export async function deleteAccount(userId, accountId) {
+  const txQ = query(
+    collection(db, "transactions"),
+    where("user_id",    "==", userId),
+    where("account_id", "==", accountId)
   );
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-}
+  const txSnap = await getDocs(txQ);
+  const txRefs = txSnap.docs.map(d => d.ref);
 
-export async function deleteAccount(accountId) {
+  // Delete in chunks of 490 (leave headroom)
+  const CHUNK = 490;
+  for (let i = 0; i < txRefs.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    txRefs.slice(i, i + CHUNK).forEach(r => batch.delete(r));
+    await batch.commit();
+  }
+
   await deleteDoc(doc(db, "accounts", accountId));
 }
 
-// ─── Transactions ───────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// TRANSACTIONS — bulk write (import pipeline)
+// ─────────────────────────────────────────────────────────────
 
 /**
- * Bulk-write transactions, skipping fingerprints already in Firestore.
- * Returns { inserted, skipped } counts.
+ * Bulk-insert parsed transactions, skipping any whose fingerprint
+ * already exists in Firestore (idempotent import).
+ *
+ * @param {string} userId
+ * @param {Array<{
+ *   account_id: string,
+ *   amount: number,
+ *   date: string,           // ISO "YYYY-MM-DD"
+ *   description: string,
+ *   normalized_description: string,
+ *   category: string,
+ *   is_duplicate: boolean,
+ *   is_transfer: boolean,
+ *   fingerprint: string,
+ * }>} transactions
+ * @returns {{ inserted: number, skipped: number }}
  */
 export async function saveTransactions(userId, transactions) {
-  // Fetch existing fingerprints for this user
+  // 1. Fetch the full fingerprint set for this user in one read.
   const existingQ = query(
     collection(db, "transactions"),
     where("user_id", "==", userId)
   );
   const existingSnap = await getDocs(existingQ);
-  const existingFingerprints = new Set(
-    existingSnap.docs.map((d) => d.data().fingerprint).filter(Boolean)
+  const seen = new Set(
+    existingSnap.docs.map(d => d.data().fingerprint).filter(Boolean)
   );
 
-  const batch = writeBatch(db);
-  let inserted = 0;
-  let skipped = 0;
+  // 2. Batch-write unseen transactions (chunks of 490).
+  const novel = transactions.filter(tx => !seen.has(tx.fingerprint));
+  const CHUNK = 490;
 
-  for (const tx of transactions) {
-    if (existingFingerprints.has(tx.fingerprint)) {
-      skipped++;
-      continue;
-    }
-    const ref = doc(collection(db, "transactions"));
-    batch.set(ref, {
-      user_id: userId,
-      account_id: tx.account_id,
-      amount: tx.amount,
-      date: tx.date,
-      description: tx.description,
-      normalized_description: tx.normalized_description,
-      category: tx.category || "uncategorized",
-      is_duplicate: tx.is_duplicate ?? false,
-      is_transfer: tx.is_transfer ?? false,
-      fingerprint: tx.fingerprint,
-      created_at: serverTimestamp(),
+  for (let i = 0; i < novel.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    novel.slice(i, i + CHUNK).forEach(tx => {
+      const ref = doc(collection(db, "transactions"));
+      batch.set(ref, {
+        user_id:                userId,
+        account_id:             tx.account_id,
+        amount:                 tx.amount,
+        date:                   tx.date,           // stored as "YYYY-MM-DD" string
+        description:            tx.description,
+        normalized_description: tx.normalized_description,
+        category:               tx.category || "uncategorized",
+        is_duplicate:           tx.is_duplicate  ?? false,
+        is_transfer:            tx.is_transfer   ?? false,
+        fingerprint:            tx.fingerprint,
+        created_at:             serverTimestamp(),
+      });
     });
-    inserted++;
+    await batch.commit();
   }
 
-  await batch.commit();
-  return { inserted, skipped };
+  return { inserted: novel.length, skipped: transactions.length - novel.length };
 }
 
-export async function getTransactions(userId, filters = {}) {
-  let q = query(
-    collection(db, "transactions"),
-    where("user_id", "==", userId),
-    orderBy("date", "desc")
-  );
+// ─────────────────────────────────────────────────────────────
+// TRANSACTIONS — single-record mutations
+// ─────────────────────────────────────────────────────────────
 
-  if (filters.account_id) {
-    q = query(q, where("account_id", "==", filters.account_id));
-  }
-  if (filters.category) {
-    q = query(q, where("category", "==", filters.category));
-  }
-
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-}
-
+/**
+ * Re-categorise a single transaction (called from the UI category picker).
+ */
 export async function updateTransactionCategory(txId, category) {
   await updateDoc(doc(db, "transactions", txId), { category });
 }
 
+/**
+ * Mark/unmark a transaction as a duplicate.
+ */
+export async function setDuplicateFlag(txId, isDuplicate) {
+  await updateDoc(doc(db, "transactions", txId), { is_duplicate: isDuplicate });
+}
+
+/**
+ * Mark/unmark a transaction as an internal transfer.
+ */
+export async function setTransferFlag(txId, isTransfer) {
+  await updateDoc(doc(db, "transactions", txId), { is_transfer: isTransfer });
+}
+
+/**
+ * Hard-delete a single transaction.
+ */
 export async function deleteTransaction(txId) {
   await deleteDoc(doc(db, "transactions", txId));
+}
+
+/**
+ * Bulk-delete transactions by id array.
+ */
+export async function deleteTransactions(txIds) {
+  const CHUNK = 490;
+  for (let i = 0; i < txIds.length; i += CHUNK) {
+    const batch = writeBatch(db);
+    txIds.slice(i, i + CHUNK).forEach(id => batch.delete(doc(db, "transactions", id)));
+    await batch.commit();
+  }
 }
